@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""codex-sub CLI: subscription-backed GPT completions, no API key.
+
+Commands:
+  login                 sign in via the official Codex device flow
+  status                show auth state (never prints secrets)
+  refresh               force a token refresh
+  complete [--model M] [--system S] [PROMPT]
+                        one completion; prompt from argv or stdin; prints text
+  models                list model ids seen in the Codex CLI binary
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from codex_sub import (  # noqa: E402
+    AuthError,
+    ClientError,
+    DEFAULT_MODEL,
+    account_id,
+    ensure_fresh_tokens,
+    refresh_now,
+    token_expiry,
+)
+from codex_sub.client import complete  # noqa: E402
+
+# Model ids observed inside the installed Codex CLI binary (codex 0.149.0).
+KNOWN_MODELS = [
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.5",
+]
+
+
+def cmd_login(_args):
+    codex = shutil.which("codex")
+    if codex:
+        print("Launching the official Codex device login...")
+        os.execvp(codex, [codex, "login", "--device-auth"])
+    print(
+        "The `codex` CLI is not installed. Install it, then run:\n"
+        "  npm install -g @openai/codex && codex login --device-auth\n"
+        "It will print a URL + one-time code; approve it in your browser\n"
+        "while signed into ChatGPT. Tokens land in ~/.codex/auth.json."
+    )
+    return 1
+
+
+def cmd_status(_args):
+    try:
+        tokens = ensure_fresh_tokens()
+    except AuthError as e:
+        print(f"not signed in: {e}")
+        return 1
+    access = tokens["access_token"]
+    print(f"signed in: yes")
+    print(f"account id: {account_id(access) or 'unknown'}")
+    print(f"access token expires: {token_expiry(access)}")
+    print(f"refresh token present: {'yes' if tokens.get('refresh_token') else 'no'}")
+    return 0
+
+
+def cmd_refresh(_args):
+    try:
+        tokens = refresh_now()
+    except AuthError as e:
+        print(f"refresh failed: {e}")
+        return 1
+    print(f"refreshed; access token expires: {token_expiry(tokens['access_token'])}")
+    return 0
+
+
+def cmd_complete(args):
+    prompt = args.prompt
+    if not prompt:
+        if sys.stdin.isatty():
+            print("no prompt given (pass one or pipe via stdin)", file=sys.stderr)
+            return 1
+        prompt = sys.stdin.read()
+    if not prompt.strip():
+        print("empty prompt", file=sys.stderr)
+        return 1
+    try:
+        text = complete(
+            prompt,
+            model=args.model,
+            system=args.system,
+            max_output_tokens=args.max_output_tokens,
+        )
+    except (AuthError, ClientError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="codex-sub", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("login", help="sign in with ChatGPT (device flow)")
+    sub.add_parser("status", help="show auth state")
+    sub.add_parser("refresh", help="force a token refresh")
+    sub.add_parser("models", help="list known model ids")
+
+    p = sub.add_parser("complete", help="one subscription-backed completion")
+    p.add_argument("prompt", nargs="?", default="", help="prompt (or pipe stdin)")
+    p.add_argument("--model", default=os.environ.get("CODEX_SUB_MODEL", DEFAULT_MODEL))
+    p.add_argument("--system", default=None, help="system instructions")
+    p.add_argument("--max-output-tokens", type=int, default=4000)
+
+    args = parser.parse_args()
+    if args.cmd == "login":
+        return cmd_login(args)
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "refresh":
+        return cmd_refresh(args)
+    if args.cmd == "models":
+        print("\n".join(KNOWN_MODELS))
+        return 0
+    if args.cmd == "complete":
+        return cmd_complete(args)
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
