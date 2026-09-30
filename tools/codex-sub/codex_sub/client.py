@@ -9,6 +9,7 @@ parses SSE streams in case the endpoint forces streaming.
 """
 
 import json
+import http.client
 import urllib.error
 import urllib.request
 
@@ -84,12 +85,16 @@ def _extract_text_sse(raw):
 def complete(prompt, model=DEFAULT_MODEL, system=None, max_output_tokens=4000,
              timeout=180):
     """One model completion, billed to the ChatGPT plan. Returns text."""
-    body = {"model": model, "stream": False}
+    # this endpoint requires stream=true; output is parsed from SSE events
+    body = {"model": model, "stream": True, "store": False}
+    # this endpoint requires `input` as a list of messages, not a string
+    messages = []
     if system:
-        body["instructions"] = system
-    body["input"] = prompt
-    if max_output_tokens:
-        body["max_output_tokens"] = max_output_tokens
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body["input"] = messages
+    # NOTE: this endpoint rejects max_output_tokens — keep the body minimal.
+    # The parameter is kept in the signature for API compatibility.
 
     def _do_request(access_token):
         req = urllib.request.Request(
@@ -99,9 +104,17 @@ def complete(prompt, model=DEFAULT_MODEL, system=None, max_output_tokens=4000,
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as res:
-            raw = res.read().decode("utf-8", errors="replace")
-            ctype = res.headers.get("Content-Type", "")
-        if "text/event-stream" in ctype:
+            try:
+                raw_bytes = res.read()
+            except http.client.IncompleteRead as e:
+                # endpoint closes the chunked stream without a terminating
+                # chunk; the partial body is complete for our purposes
+                raw_bytes = e.partial
+            raw = raw_bytes.decode("utf-8", errors="replace")
+            ctype = res.headers.get("Content-Type", "") or ""
+        # the endpoint streams SSE but sends no Content-Type header,
+        # so sniff the body instead of trusting the header
+        if "text/event-stream" in ctype or raw.lstrip().startswith("event:"):
             return _extract_text_sse(raw)
         return _extract_text_nostream(json.loads(raw))
 
